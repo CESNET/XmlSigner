@@ -1,7 +1,6 @@
 package com.cesnet.signer;
 
 import au.csiro.nt.pdsp.util.X509KeySelector;
-import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileNotFoundException;
@@ -9,15 +8,11 @@ import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
-import java.io.PrintStream;
 import java.lang.reflect.Constructor;
 import java.security.KeyStore;
-import java.security.KeyStore.PasswordProtection;
-import java.security.KeyStore.PrivateKeyEntry;
 import java.security.KeyStoreException;
 import java.security.PrivateKey;
 import java.security.Provider;
-import java.security.Provider.Service;
 import java.security.Security;
 import java.security.cert.Certificate;
 import java.security.cert.X509Certificate;
@@ -28,7 +23,6 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.Properties;
 import java.util.Set;
-import javax.security.auth.x500.X500Principal;
 import javax.xml.crypto.dsig.Reference;
 import javax.xml.crypto.dsig.SignedInfo;
 import javax.xml.crypto.dsig.XMLSignature;
@@ -40,64 +34,43 @@ import javax.xml.crypto.dsig.keyinfo.KeyInfoFactory;
 import javax.xml.crypto.dsig.keyinfo.X509Data;
 import javax.xml.crypto.dsig.spec.C14NMethodParameterSpec;
 import javax.xml.crypto.dsig.spec.TransformParameterSpec;
-import javax.xml.parsers.DocumentBuilder;
 import javax.xml.parsers.DocumentBuilderFactory;
 import javax.xml.transform.Transformer;
 import javax.xml.transform.TransformerFactory;
 import javax.xml.transform.dom.DOMSource;
 import javax.xml.transform.stream.StreamResult;
 import org.w3c.dom.Document;
-import org.w3c.dom.Element;
 import org.w3c.dom.Node;
 import org.w3c.dom.NodeList;
 
 public class XmlSigner {
 
     private KeyStore keyStore;
+    // Pin to access keystore
     private char[] pin;
+    // Metadata to sign
     private String inputFile = null;
+    // Signed metadata
     private String outputFile = null;
     private String cfgFile = null;
+    // Signing key alias
     private String signingAlias = null;
+    // Security provider
     private String providerClass = "sun.security.pkcs11.SunPKCS11";
+    // Security provider type
     private String providerType = "PKCS11";
     private String providerConfig = null;
     private boolean infoOnly = false;
 
-    public void sign(Node node, String signer) throws Exception {
-        if (signer == null) {
-            throw new IllegalArgumentException("Missing signer");
-        }
-
-        if (node == null) {
-            throw new IllegalArgumentException("Not signing empty document");
-        }
-
-        PrivateKey signerKey = (PrivateKey) this.keyStore.getKey(signer, this.pin);
-        if (signerKey == null) {
-            throw new IllegalArgumentException("No such signer: " + signer);
-        }
-
-        X509Certificate certificate = (X509Certificate) this.keyStore.getCertificate(signer);
-        assert (node != null);
-        Node firstChild = node.getFirstChild();
-        assert (firstChild != null);
-        DOMSignContext dsc = new DOMSignContext(signerKey, node, firstChild);
-        String providerName = System.getProperty("jsr105Provider", "org.jcp.xml.dsig.internal.dom.XMLDSigRI");
-        XMLSignatureFactory fac = XMLSignatureFactory.getInstance("DOM", (Provider) Class.forName(providerName).newInstance());
-
-        Reference ref = fac.newReference("", fac.newDigestMethod("http://www.w3.org/2000/09/xmldsig#sha1", null), Collections.singletonList(fac.newTransform("http://www.w3.org/2000/09/xmldsig#enveloped-signature", (TransformParameterSpec) null)), null, null);
-
-        SignedInfo si = fac.newSignedInfo(fac.newCanonicalizationMethod("http://www.w3.org/TR/2001/REC-xml-c14n-20010315#WithComments", (C14NMethodParameterSpec) null), fac.newSignatureMethod("http://www.w3.org/2000/09/xmldsig#rsa-sha1", null), Collections.singletonList(ref));
-
-        KeyInfoFactory kif = fac.getKeyInfoFactory();
-        X509Data xd = kif.newX509Data(Collections.singletonList(certificate));
-        KeyInfo ki = kif.newKeyInfo(Collections.singletonList(xd));
-        XMLSignature signature = fac.newXMLSignature(si, ki);
-        signature.sign(dsc);
-    }
-
-    public boolean sign2(String signer, String xmlInFile, String xmlOutFile) throws Exception {
+    /**
+     * Signs metadata and validates the signature
+     * @param signer
+     * @param xmlInFile File to sign
+     * @param xmlOutFile Signed file
+     * @return true if metadata were successfiuly signed and signature validated; false otherwise
+     * @throws Exception
+     */
+    public boolean sign(String signer, String xmlInFile, String xmlOutFile) throws Exception {
         if (signer == null) {
             System.err.println("Error: Missing signer");
             System.exit(3);
@@ -156,10 +129,18 @@ public class XmlSigner {
         }
         DOMValidateContext valContext = new DOMValidateContext(new X509KeySelector(), nl.item(0));
         XMLSignature signature2 = fac.unmarshalXMLSignature(valContext);
-        boolean coreValidity = signature2.validate(valContext);
-        return coreValidity;
+        return signature2.validate(valContext);
     }
 
+    /**
+     * This function is not used right now. It signs metadata using Java keystore instead of HSM.
+     * @param keyStoreFile
+     * @param keystorePassword
+     * @param signer
+     * @param xmlInFile
+     * @param xmlOutFile
+     * @throws Exception
+     */
     public void signJKS(String keyStoreFile, String keystorePassword, String signer, String xmlInFile, String xmlOutFile) throws Exception {
         XMLSignatureFactory fac = XMLSignatureFactory.getInstance("DOM");
         Reference ref = fac.newReference("", fac.newDigestMethod("http://www.w3.org/2000/09/xmldsig#sha1", null), Collections.singletonList(fac.newTransform("http://www.w3.org/2000/09/xmldsig#enveloped-signature", (TransformParameterSpec) null)), null, null);
@@ -191,7 +172,16 @@ public class XmlSigner {
         trans.transform(new DOMSource(doc), new StreamResult(os));
     }
 
-    public final void initialize(String providerClassName, String providerType, String configName, String keyStoreLocation, char[] pin) throws Exception {
+    /**
+     * Initialize the keystore
+     * @param providerClassName
+     * @param providerType
+     * @param configName
+     * @param keyStoreLocation
+     * @param pin
+     * @throws Exception
+     */
+    private final void initialize(String providerClassName, String providerType, String configName, String keyStoreLocation, char[] pin) throws Exception {
         if ((providerClassName != null) && (providerClassName.length() > 0)) {
             Class providerClass = Class.forName(providerClassName);
             Provider cryptoProvider = null;
@@ -227,16 +217,11 @@ public class XmlSigner {
                 System.out.println("        Services:");
                 while (it.hasNext()) {
                     Provider.Service ps = (Provider.Service) it.next();
-                    ps.getType();
-                    ps.getAlgorithm();
-                    ps.getClassName();
                     System.out.println("            " + ps.getType() + " - " + ps.getAlgorithm() + " - " + ps.getClassName());
                 }
                 System.out.println();
                 System.out.println("        Setup:");
                 Enumeration keys = p.keys();
-
-                String info = p.getInfo();
 
                 while (keys.hasMoreElements()) {
                     Object key = keys.nextElement();
@@ -249,7 +234,11 @@ public class XmlSigner {
         this.keyStore.load(ksIn, pin);
     }
 
-    public void printInfo() throws KeyStoreException {
+    /**
+     * Prints information about keystore
+     * @throws KeyStoreException
+     */
+    private void printInfo() throws KeyStoreException {
         int size = this.keyStore.size();
         System.out.println("Entries in keystore: " + size);
 
@@ -280,54 +269,20 @@ public class XmlSigner {
         }
     }
 
+    /**
+     *
+     * @throws Exception
+     */
     private void signMetadata() throws Exception {
-        Node toBeSigned = readFile(this.inputFile);
-        sign(toBeSigned, this.signingAlias);
-        TransformerFactory tf = TransformerFactory.newInstance();
-        Transformer t = tf.newTransformer();
-        ByteArrayOutputStream baos = new ByteArrayOutputStream();
-        t.transform(new DOMSource(toBeSigned), new StreamResult(baos));
-        byte[] bs = baos.toByteArray();
-        FileOutputStream out = new FileOutputStream(this.outputFile);
-        out.write(bs);
-        out.close();
-    }
-
-    private void signMetadata2() throws Exception {
-        if (!sign2(this.signingAlias, this.inputFile, this.outputFile)) {
+        if (!sign(this.signingAlias, this.inputFile, this.outputFile)) {
             System.err.println("Xml file was signed, but validation failed. Please contact author at jan.chvojka@cesnet.cz");
             System.exit(4);
         }
     }
 
-    private boolean verify(String fileName) throws Exception {
-        File file = new File(fileName);
-        if (!file.canRead()) {
-            throw new IOException("Cannot open file " + fileName);
-        }
-        DocumentBuilderFactory dbf = DocumentBuilderFactory.newInstance();
-        DocumentBuilder db = dbf.newDocumentBuilder();
-        Document doc = db.parse(file);
-
-        NodeList nl = doc.getElementsByTagNameNS("http://www.w3.org/2000/09/xmldsig#", "Signature");
-        if (nl.getLength() == 0) {
-            throw new Exception("Cannot find Signature element");
-        }
-        XMLSignatureFactory fac = XMLSignatureFactory.getInstance("DOM");
-        return true;
-    }
-
-    private Node readFile(String filename) throws Exception {
-        File file = new File(filename);
-        if (!file.canRead()) {
-            throw new IOException("Cannot open file " + filename);
-        }
-        DocumentBuilderFactory dbf = DocumentBuilderFactory.newInstance();
-        dbf.setNamespaceAware(true);
-        Document doc = dbf.newDocumentBuilder().parse(new FileInputStream(filename));
-        return doc.getDocumentElement();
-    }
-
+    /**
+     * Prints program usage with configuration files examples
+     */
     private void printUsage() {
         StringBuilder sb = new StringBuilder("Usage: XmlSigner -h");
         sb.append("Usage: XmlSigner -h\n");
@@ -351,6 +306,12 @@ public class XmlSigner {
         System.out.println(sb.toString());
     }
 
+    /**
+     * Proccesses command line parameters
+     * @param args
+     * @return
+     * @throws Exception
+     */
     private boolean parseParams(String[] args) throws Exception {
         if (args.length == 0) {
             printUsage();
@@ -419,18 +380,22 @@ public class XmlSigner {
         return true;
     }
 
+    /**
+     * Processes configuration file
+     * @param iniFileName
+     * @return
+     * @throws Exception
+     */
     private boolean loadIniParams(String iniFileName) throws Exception {
         boolean ret = true;
         Properties p = new Properties();
         p.load(new FileInputStream(iniFileName));
-        StringBuffer sb = new StringBuffer();
+        StringBuilder sb = new StringBuilder();
         String err = "Error: While using configuration file " + iniFileName + " there was error\n";
 
         String s = p.getProperty("providerclass");
         if (s == null) {
-            if (ret) {
-                sb.append(err);
-            }
+            sb.append(err);
             sb.append("Error: Cannot find key \"providerclass\" in config file.\n");
             ret = false;
         } else {
@@ -494,12 +459,14 @@ public class XmlSigner {
                 System.exit(1);
                 return;
             }
+
             xs.initialize(xs.providerClass, xs.providerType, xs.providerConfig, null, xs.pin);
             if (xs.infoOnly) {
                 xs.printInfo();
                 System.exit(0);
             }
-            xs.signMetadata2();
+            // Sign the federation metadata
+            xs.signMetadata();
             System.exit(0);
         } catch (ClassNotFoundException e) {
             System.err.println("Class not found: " + e.getMessage() + "\nTry to check value of \"providerclass\" in config file " + xs.cfgFile + ".");
