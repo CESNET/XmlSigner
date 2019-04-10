@@ -1,479 +1,616 @@
 package com.cesnet.signer;
 
-import au.csiro.nt.pdsp.util.X509KeySelector;
-import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileNotFoundException;
 import java.io.FileOutputStream;
 import java.io.IOException;
-import java.io.InputStream;
 import java.io.OutputStream;
-import java.lang.reflect.Constructor;
+
 import java.security.KeyStore;
 import java.security.KeyStoreException;
 import java.security.PrivateKey;
 import java.security.Provider;
+import java.security.PublicKey;
 import java.security.Security;
+import java.security.Provider.Service;
 import java.security.cert.Certificate;
 import java.security.cert.X509Certificate;
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.Enumeration;
-import java.util.Iterator;
-import java.util.List;
-import java.util.Properties;
-import java.util.Set;
-import javax.xml.crypto.dsig.Reference;
-import javax.xml.crypto.dsig.SignedInfo;
-import javax.xml.crypto.dsig.XMLSignature;
-import javax.xml.crypto.dsig.XMLSignatureFactory;
-import javax.xml.crypto.dsig.dom.DOMSignContext;
-import javax.xml.crypto.dsig.dom.DOMValidateContext;
-import javax.xml.crypto.dsig.keyinfo.KeyInfo;
-import javax.xml.crypto.dsig.keyinfo.KeyInfoFactory;
-import javax.xml.crypto.dsig.keyinfo.X509Data;
-import javax.xml.crypto.dsig.spec.C14NMethodParameterSpec;
-import javax.xml.crypto.dsig.spec.TransformParameterSpec;
+
+import java.util.*;
+
 import javax.xml.parsers.DocumentBuilderFactory;
 import javax.xml.transform.Transformer;
 import javax.xml.transform.TransformerFactory;
 import javax.xml.transform.dom.DOMSource;
 import javax.xml.transform.stream.StreamResult;
+
+import org.apache.xml.security.Init;
+import org.apache.xml.security.exceptions.XMLSecurityException;
+import org.apache.xml.security.keys.KeyInfo;
+import org.apache.xml.security.keys.content.X509Data;
+import org.apache.xml.security.signature.Reference;
+import org.apache.xml.security.signature.XMLSignature;
+import org.apache.xml.security.signature.reference.ReferenceData;
+import org.apache.xml.security.signature.reference.ReferenceSubTreeData;
+import org.apache.xml.security.transforms.Transform;
+import org.apache.xml.security.transforms.TransformationException;
+import org.apache.xml.security.transforms.Transforms;
+
+import org.opensaml.xml.signature.Signature;
+import org.opensaml.xml.util.DatatypeHelper;
+import org.opensaml.xml.util.XMLHelper;
+
+import org.w3c.dom.Attr;
 import org.w3c.dom.Document;
+import org.w3c.dom.Element;
+import org.w3c.dom.NamedNodeMap;
 import org.w3c.dom.Node;
 import org.w3c.dom.NodeList;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 public class XmlSigner {
+    private static final String SHA1_DIGEST   = "http://www.w3.org/2000/09/xmldsig#sha1";
+    private static final String SHA1_METHOD   = "http://www.w3.org/2000/09/xmldsig#rsa-sha1";
+    private static final String SHA256_DIGEST = "http://www.w3.org/2001/04/xmlenc#sha256";
+    private static final String SHA256_METHOD = "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256";
+    private static final String SHA512_DIGEST = "http://www.w3.org/2001/04/xmlenc#sha512";
+    private static final String SHA512_METHOD = "http://www.w3.org/2001/04/xmldsig-more#rsa-sha512";
 
     private KeyStore keyStore;
-    // Pin to access keystore
-    private char[] pin;
-    // Metadata to sign
+    private String keyStoreType;
+    private String keyStoreProvider;
+    private String keyStoreFileName;
+    private char[] password;
     private String inputFile = null;
-    // Signed metadata
     private String outputFile = null;
     private String cfgFile = null;
-    // Signing key alias
+    private String digestMethod = SHA256_DIGEST;
+    private String signatureMethod = SHA256_METHOD;
     private String signingAlias = null;
-    // Security provider
-    private String providerClass = "sun.security.pkcs11.SunPKCS11";
-    // Security provider type
-    private String providerType = "PKCS11";
-    private String providerConfig = null;
     private boolean infoOnly = false;
 
-    /**
-     * Signs metadata and validates the signature
-     * @param signer
-     * @param xmlInFile File to sign
-     * @param xmlOutFile Signed file
-     * @return true if metadata were successfiuly signed and signature validated; false otherwise
-     * @throws Exception
-     */
-    public boolean sign(String signer, String xmlInFile, String xmlOutFile) throws Exception {
+    private static String signaturePosition = "FIRST";
+
+    private static Logger logger = LoggerFactory.getLogger(XmlSigner.class);
+
+    private static Element getSignatureElement(Document xmlDoc) {
+        logger.trace("getSignatureElement <");
+        List sigElements = XMLHelper.getChildElementsByTagNameNS(xmlDoc.getDocumentElement(), Signature.DEFAULT_ELEMENT_NAME.getNamespaceURI(), Signature.DEFAULT_ELEMENT_NAME.getLocalPart());
+        if (sigElements.isEmpty()) {
+            logger.trace("getSignatureElement >");
+            return null;
+        } else {
+            if (sigElements.size() > 1) {
+                logger.error("XML document contained more than one signature, unable to process, exiting");
+                System.exit(7);
+            }
+            logger.trace("getSignatureElement >");
+            return (Element)sigElements.get(0);
+        }
+    }
+
+    private static String getSignatureReferenceUri(String referenceIdAttributeName, Element rootElement) {
+        logger.trace("getSignatureReferenceUri <");
+        String reference = "";
+        if (referenceIdAttributeName != null) {
+            Attr referenceAttribute = (Attr)rootElement.getAttributes().getNamedItem(referenceIdAttributeName);
+            if (referenceAttribute != null) {
+                rootElement.setIdAttributeNode(referenceAttribute, true);
+                reference = DatatypeHelper.safeTrim(referenceAttribute.getValue());
+                if (reference.length() > 0) {
+                    reference = "#" + reference;
+                }
+            }
+        }
+        logger.trace("getSignatureReferenceUri >");
+        return reference;
+    }
+
+    private static void addSignatureELement(String position, Element root, Element signature) {
+        logger.trace("addSignatureELement <");
+        switch(position) {
+            case "FIRST":
+                root.insertBefore(signature, root.getFirstChild());
+                break;
+
+            case "LAST":
+                root.appendChild(signature);
+                break;
+        }
+    }
+
+    private static void markIdAttribute(Element docElement, Reference reference) {
+        logger.trace("markIdAttribute <");
+        String referenceUri = reference.getURI();
+        if (!DatatypeHelper.isEmpty(referenceUri)) {
+            if (XMLHelper.getIdAttribute(docElement) == null) {
+                if (!referenceUri.startsWith("#")) {
+                    logger.error("Signature Reference URI was not a document fragment reference: " + referenceUri);
+                    System.exit(100);
+                }
+
+                String id = referenceUri.substring(1);
+                NamedNodeMap attributes = docElement.getAttributes();
+
+                for(int i = 0; i < attributes.getLength(); ++i) {
+                    Attr attribute = (Attr)attributes.item(i);
+                    if (id.equals(attribute.getValue())) {
+                        docElement.setIdAttributeNode(attribute, true);
+                        logger.trace("markIdAttribute >");
+                        return;
+                    }
+                }
+
+            }
+        }
+    }
+
+    private static Reference extractReference(XMLSignature signature) {
+        logger.trace("extractReference <");
+        int numReferences = signature.getSignedInfo().getLength();
+        if (numReferences != 1) {
+            logger.error("Signature SignedInfo had invalid number of References: " + numReferences);
+            System.exit(101);
+        }
+
+        Reference ref = null;
+
+        try {
+            ref = signature.getSignedInfo().item(0);
+        } catch (XMLSecurityException e) {
+            logger.error("Apache XML Security exception obtaining Reference" + e);
+            System.exit(102);
+        }
+
+        if (ref == null) {
+            logger.error("Signature Reference was null");
+            System.exit(103);
+        }
+
+        return ref;
+    }
+
+    private static void validateSignatureReferenceUri(Document xmlDocument, Reference reference) {
+        logger.trace("validateSignatureReferenceUri <");
+        ReferenceData refData = reference.getReferenceData();
+        if (refData instanceof ReferenceSubTreeData) {
+            ReferenceSubTreeData subTree = (ReferenceSubTreeData)refData;
+            Node root = subTree.getRoot();
+            Node resolvedSignedNode = root;
+            if (root.getNodeType() == 9) {
+                resolvedSignedNode = ((Document)root).getDocumentElement();
+            }
+
+            Element expectedSignedNode = xmlDocument.getDocumentElement();
+            if (!expectedSignedNode.isSameNode(resolvedSignedNode)) {
+                logger.error("Signature Reference URI \"" + reference.getURI() + "\" was resolved to a node other than the document element");
+                System.exit(200);
+            }
+        } else {
+            logger.error("Signature Reference URI did not resolve to a subtree");
+            System.exit(201);
+        }
+
+    }
+
+    private static void validateSignatureTransforms(Reference reference) {
+        logger.trace("validateSignatureTransforms <");
+        Transforms transforms = null;
+
+        try {
+            transforms = reference.getTransforms();
+        } catch (XMLSecurityException e) {
+            logger.error("Apache XML Security error obtaining Transforms instance: " + e.getMessage());
+            System.exit(202);
+        }
+
+        if (transforms == null) {
+            logger.error("Error obtaining Transforms instance, null was returned");
+            System.exit(203);
+        }
+
+        int numTransforms = transforms.getLength();
+        if (numTransforms > 2) {
+            logger.error("Invalid number of Transforms was present: " + numTransforms);
+            System.exit(204);
+        }
+
+        boolean sawEnveloped = false;
+
+        for(int i = 0; i < numTransforms; ++i) {
+            Transform transform = null;
+
+            try {
+                transform = transforms.item(i);
+            } catch (TransformationException var7) {
+                logger.error("Error obtaining transform instance");
+                System.exit(200);
+            }
+
+            String uri = transform.getURI();
+            if ("http://www.w3.org/2000/09/xmldsig#enveloped-signature".equals(uri)) {
+                logger.error("Saw Enveloped signature transform");
+                sawEnveloped = true;
+            } else if (!"http://www.w3.org/2001/10/xml-exc-c14n#".equals(uri) && !"http://www.w3.org/2001/10/xml-exc-c14n#WithComments".equals(uri)) {
+                logger.error("Saw invalid signature transform: " + uri);
+                System.exit(200);
+            } else {
+                logger.error("Saw Exclusive C14N signature transform");
+            }
+        }
+
+        if (!sawEnveloped) {
+            logger.error("Signature was missing the required Enveloped signature transform");
+            System.exit(200);
+        }
+
+    }
+
+    private static void validateSignatureReference(Document xmlDocument, Reference ref) {
+        validateSignatureReferenceUri(xmlDocument, ref);
+        validateSignatureTransforms(ref);
+    }
+
+    private static void populateKeyInfo(Document doc, KeyInfo keyInfo, Certificate crt) {
+        logger.trace("populateKeyInfo <");
+        try {
+            PublicKey pk = crt.getPublicKey();
+            keyInfo.add(pk);
+            X509Data x509Data = new X509Data(doc);
+            keyInfo.add(x509Data);
+            X509Certificate xc = (X509Certificate)crt;
+            x509Data.addCertificate(xc);
+        } catch (XMLSecurityException var7) {
+            logger.error("Cannot add KeyInfo");
+            System.exit(30);
+        }
+
+    }
+
+    private boolean signXmlFile(String signer, String xmlInFile, String xmlOutFile) throws Exception {
+        logger.trace("signXmlFile <");
         if (signer == null) {
-            System.err.println("Error: Missing signer");
+            logger.error("Missing signer");
             System.exit(3);
         }
 
-        PrivateKey signerKey = (PrivateKey) this.keyStore.getKey(signer, this.pin);
+        PrivateKey signerKey = (PrivateKey)this.keyStore.getKey(signer, this.password);
         if (signerKey == null) {
-            System.err.println("Error: No such signer: " + signer);
-            System.exit(3);
+            logger.error("No such signer: " + signer);
+            System.exit(4);
         }
 
-        X509Certificate certificate = (X509Certificate) this.keyStore.getCertificate(signer);
-        XMLSignatureFactory fac = XMLSignatureFactory.getInstance("DOM");
-        Reference ref = fac.newReference("", fac.newDigestMethod("http://www.w3.org/2000/09/xmldsig#sha1", null), Collections.singletonList(fac.newTransform("http://www.w3.org/2000/09/xmldsig#enveloped-signature", (TransformParameterSpec) null)), null, null);
-
-        SignedInfo si = fac.newSignedInfo(fac.newCanonicalizationMethod("http://www.w3.org/TR/2001/REC-xml-c14n-20010315", (C14NMethodParameterSpec) null), fac.newSignatureMethod("http://www.w3.org/2000/09/xmldsig#rsa-sha1", null), Collections.singletonList(ref));
-
-        KeyInfoFactory kif = fac.getKeyInfoFactory();
-        List x509Content = new ArrayList();
-        x509Content.add(certificate.getSubjectX500Principal().getName());
-        x509Content.add(certificate);
-        X509Data xd = kif.newX509Data(x509Content);
-        KeyInfo ki = kif.newKeyInfo(Collections.singletonList(xd));
-
+        Certificate crt = this.keyStore.getCertificate(signer);
+        PublicKey pubKey = crt.getPublicKey();
         DocumentBuilderFactory dbf = DocumentBuilderFactory.newInstance();
         dbf.setNamespaceAware(true);
         Document doc = null;
+
         try {
             doc = dbf.newDocumentBuilder().parse(new FileInputStream(xmlInFile));
         } catch (IOException e) {
-            System.err.println("Error: Cannot open input file " + xmlInFile);
-            System.exit(3);
+            logger.error("Cannot open input file " + xmlInFile);
+            System.exit(5);
         }
 
-        Node firstChild = doc.getDocumentElement().getFirstChild();
-        DOMSignContext dsc = new DOMSignContext(signerKey, doc.getDocumentElement(), firstChild);
+        Element documentRoot = doc.getDocumentElement();
+        Element signatureElement = getSignatureElement(doc);
+        if (signatureElement != null) {
+            logger.error("XML document is already signed");
+            System.exit(8);
+        }
 
-        XMLSignature signature = fac.newXMLSignature(si, ki);
-        signature.sign(dsc);
-        OutputStream os = new FileOutputStream(xmlOutFile);
-        TransformerFactory tf = TransformerFactory.newInstance();
-        Transformer trans = tf.newTransformer();
-        trans.transform(new DOMSource(doc), new StreamResult(os));
+        String c14nAlgorithm = "http://www.w3.org/2001/10/xml-exc-c14n#";
 
-        Document doc2 = null;
         try {
-            doc2 = dbf.newDocumentBuilder().parse(new FileInputStream(xmlOutFile));
-        } catch (IOException e) {
-            System.err.println("Error: Cannot open output file for validation " + xmlOutFile);
-            System.exit(3);
-        }
-        NodeList nl = doc2.getElementsByTagNameNS("http://www.w3.org/2000/09/xmldsig#", "Signature");
-        if (nl.getLength() == 0) {
-            System.err.println("Error: Validation fails - cannot find Signature element");
-            System.exit(4);
-        }
-        DOMValidateContext valContext = new DOMValidateContext(new X509KeySelector(), nl.item(0));
-        XMLSignature signature2 = fac.unmarshalXMLSignature(valContext);
-        return signature2.validate(valContext);
-    }
-
-    /**
-     * This function is not used right now. It signs metadata using Java keystore instead of HSM.
-     * @param keyStoreFile
-     * @param keystorePassword
-     * @param signer
-     * @param xmlInFile
-     * @param xmlOutFile
-     * @throws Exception
-     */
-    public void signJKS(String keyStoreFile, String keystorePassword, String signer, String xmlInFile, String xmlOutFile) throws Exception {
-        XMLSignatureFactory fac = XMLSignatureFactory.getInstance("DOM");
-        Reference ref = fac.newReference("", fac.newDigestMethod("http://www.w3.org/2000/09/xmldsig#sha1", null), Collections.singletonList(fac.newTransform("http://www.w3.org/2000/09/xmldsig#enveloped-signature", (TransformParameterSpec) null)), null, null);
-
-        SignedInfo si = fac.newSignedInfo(fac.newCanonicalizationMethod("http://www.w3.org/TR/2001/REC-xml-c14n-20010315", (C14NMethodParameterSpec) null), fac.newSignatureMethod("http://www.w3.org/2000/09/xmldsig#rsa-sha1", null), Collections.singletonList(ref));
-
-        KeyStore ks = KeyStore.getInstance("JKS");
-        ks.load(new FileInputStream(keyStoreFile), keystorePassword.toCharArray());
-        KeyStore.PrivateKeyEntry keyEntry = (KeyStore.PrivateKeyEntry) ks.getEntry(signer, new KeyStore.PasswordProtection(keystorePassword.toCharArray()));
-
-        X509Certificate cert = (X509Certificate) keyEntry.getCertificate();
-        KeyInfoFactory kif = fac.getKeyInfoFactory();
-        List x509Content = new ArrayList();
-        x509Content.add(cert.getSubjectX500Principal().getName());
-        x509Content.add(cert);
-        X509Data xd = kif.newX509Data(x509Content);
-        KeyInfo ki = kif.newKeyInfo(Collections.singletonList(xd));
-
-        DocumentBuilderFactory dbf = DocumentBuilderFactory.newInstance();
-        dbf.setNamespaceAware(true);
-        Document doc = dbf.newDocumentBuilder().parse(new FileInputStream(xmlInFile));
-
-        DOMSignContext dsc = new DOMSignContext(keyEntry.getPrivateKey(), doc.getDocumentElement());
-        XMLSignature signature = fac.newXMLSignature(si, ki);
-        signature.sign(dsc);
-        OutputStream os = new FileOutputStream(xmlOutFile);
-        TransformerFactory tf = TransformerFactory.newInstance();
-        Transformer trans = tf.newTransformer();
-        trans.transform(new DOMSource(doc), new StreamResult(os));
-    }
-
-    /**
-     * Initialize the keystore
-     * @param providerClassName
-     * @param providerType
-     * @param configName
-     * @param keyStoreLocation
-     * @param pin
-     * @throws Exception
-     */
-    private final void initialize(String providerClassName, String providerType, String configName, String keyStoreLocation, char[] pin) throws Exception {
-        if ((providerClassName != null) && (providerClassName.length() > 0)) {
-            Class providerClass = Class.forName(providerClassName);
-            Provider cryptoProvider = null;
-            Constructor constructor = providerClass.getConstructor(new Class[]{String.class});
-            if ((configName != null) && (configName.length() > 0)) {
-                cryptoProvider = (Provider) constructor.newInstance(new Object[]{configName});
-            } else {
-                cryptoProvider = (Provider) providerClass.newInstance();
+            XMLSignature signature = new XMLSignature(doc, "#", this.signatureMethod, c14nAlgorithm);
+            Transforms contentTransforms = new Transforms(doc);
+            contentTransforms.addTransform("http://www.w3.org/2000/09/xmldsig#enveloped-signature");
+            contentTransforms.addTransform("http://www.w3.org/2001/10/xml-exc-c14n#");
+            signature.addDocument(getSignatureReferenceUri("ID", documentRoot), contentTransforms, this.digestMethod);
+            signatureElement = signature.getElement();
+            addSignatureELement(signaturePosition, documentRoot, signatureElement);
+            signature.sign(signerKey);
+            populateKeyInfo(doc, signature.getKeyInfo(), crt);
+            signatureElement = getSignatureElement(doc);
+            if (signatureElement == null) {
+                logger.error("Signature validation: document is not signed");
+                System.exit(10);
             }
 
-            assert (cryptoProvider != null);
-            int pos = Security.addProvider(cryptoProvider);
-            if (this.infoOnly) {
-                System.out.println("Setting provider, position " + pos);
+            signature = null;
+
+            try {
+                signature = new XMLSignature(signatureElement, "");
+            } catch (XMLSecurityException e) {
+                logger.error("Unable to read XML signature: " + e);
+                System.exit(11);
             }
 
-        }
-
-        this.keyStore = KeyStore.getInstance(providerType);
-        InputStream ksIn = null;
-        if ((keyStoreLocation != null) && (keyStoreLocation.length() > 0)) {
-            File ksFile = new File(keyStoreLocation);
-            ksIn = new FileInputStream(ksFile);
-        }
-        if (this.infoOnly) {
-            Provider[] providers = Security.getProviders();
-            int prolen = providers.length;
-            System.out.println("Provider list (" + prolen + " found):\n");
-            for (Provider p : providers) {
-                System.out.println("    " + p.getName() + " (ver. " + p.getVersion() + ") - " + p.size() + " entries\n");
-                Set services = p.getServices();
-                Iterator it = services.iterator();
-                System.out.println("        Services:");
-                while (it.hasNext()) {
-                    Provider.Service ps = (Provider.Service) it.next();
-                    System.out.println("            " + ps.getType() + " - " + ps.getAlgorithm() + " - " + ps.getClassName());
-                }
-                System.out.println();
-                System.out.println("        Setup:");
-                Enumeration keys = p.keys();
-
-                while (keys.hasMoreElements()) {
-                    Object key = keys.nextElement();
-                    Object value = p.get(key);
-                    System.out.println("            " + key.toString() + " = " + value.toString());
-                }
-                System.out.println();
+            if (signature.getObjectLength() != 0) {
+                logger.error("Signature contained an Object element, this is not allowed");
+                System.exit(12);
             }
+
+            Reference ref = extractReference(signature);
+            markIdAttribute(doc.getDocumentElement(), ref);
+            if (!signature.checkSignatureValue(pubKey)) {
+                logger.error("XML document signature verification failed");
+                System.exit(91);
+            }
+
+            TransformerFactory tfac = TransformerFactory.newInstance();
+            Transformer serializer = tfac.newTransformer();
+            OutputStream os = new FileOutputStream(xmlOutFile);
+            serializer.setOutputProperty("encoding", "UTF-8");
+            serializer.transform(new DOMSource(doc), new StreamResult(os));
+            return true;
+        } catch (XMLSecurityException e) {
+            logger.error("Unable to create XML document signature, " + e.toString());
+            System.exit(9);
+            return false;
         }
-        this.keyStore.load(ksIn, pin);
     }
 
-    /**
-     * Prints information about keystore
-     * @throws KeyStoreException
-     */
+    private void initialize(String storeFileName, char[] password) throws Exception {
+        logger.trace("initialize <");
+        System.setProperty("protect", "cardset");
+        FileInputStream storeStream = new FileInputStream(storeFileName);
+        keyStore = KeyStore.getInstance(keyStoreType, keyStoreProvider);
+        keyStore.load(storeStream, password);
+        Init.init();
+
+    }
+
     private void printInfo() throws KeyStoreException {
-        int size = this.keyStore.size();
-        System.out.println("Entries in keystore: " + size);
+        logger.trace("printInfo <");
+        Provider[] providers = Security.getProviders();
+        System.out.println("Provider list (" + providers.length + " providers found):\n");
 
-        String providerName = this.keyStore.getProvider().getName();
-        System.out.println("Provider name: " + providerName);
+        for(Provider p: providers) {
+            System.out.println("    " + p.getName() + " (ver. " + p.getVersion() + ") - " + p.size() + " entries\n");
+            Set services = p.getServices();
+            Iterator it = services.iterator();
+            System.out.println("        Services:");
 
-        String providerType = this.keyStore.getType();
-        System.out.println("Provider type: " + providerType + "\n");
+            while(it.hasNext()) {
+                Service ps = (Service)it.next();
+                System.out.println("            " + ps.getType() + " - " + ps.getAlgorithm() + " - " + ps.getClassName());
+            }
 
+            System.out.println();
+            System.out.println("        Setup:");
+            Enumeration keys = p.keys();
+
+            while(keys.hasMoreElements()) {
+                Object key = keys.nextElement();
+                Object value = p.get(key);
+                System.out.println("            " + key.toString() + " = " + value.toString());
+            }
+
+            System.out.println();
+        }
+
+        System.out.println("Entries in keystore: " + this.keyStore.size());
+        System.out.println("Provider name: " + this.keyStore.getProvider().getName());
+        System.out.println("Provider type: " + this.keyStore.getType() + "\n");
         Enumeration aliases = this.keyStore.aliases();
-        while (aliases.hasMoreElements()) {
-            String alias = (String) aliases.nextElement();
+
+        while(aliases.hasMoreElements()) {
+            String alias = (String)aliases.nextElement();
             if (this.keyStore.isCertificateEntry(alias)) {
-                System.out.println("Alias (certificate): " + alias);
                 Certificate cert = this.keyStore.getCertificate(alias);
-                System.out.println("Cert: " + cert.toString());
-                System.out.println();
-            } else if (this.keyStore.isCertificateEntry(alias)) {
-                System.out.println("Alias (key): " + alias);
-                System.out.println();
+                System.out.println("Alias (certificate): " + alias + "\nCert: " + cert.toString() + "\n");
+            } else if (this.keyStore.isKeyEntry(alias)) {
+                System.out.println("Alias (key): " + alias + "\n");
             } else {
-                System.out.println("Alias (unknown type): " + alias);
                 Certificate[] certChain = this.keyStore.getCertificateChain(alias);
-                for (Certificate cert : certChain) {
+                System.out.println("Alias (unknown type): " + alias);
+                for(Certificate cert: certChain) {
                     System.out.println("Cert: " + cert.toString() + "\n\n");
                 }
             }
         }
+
     }
 
-    /**
-     *
-     * @throws Exception
-     */
+
     private void signMetadata() throws Exception {
-        if (!sign(this.signingAlias, this.inputFile, this.outputFile)) {
-            System.err.println("Xml file was signed, but validation failed. Please contact author at jan.chvojka@cesnet.cz");
+        if (!this.signXmlFile(this.signingAlias, this.inputFile, this.outputFile)) {
+            logger.error("Xml file was signed, but validation failed. Please contact support at support@cesnet.cz");
             System.exit(4);
         }
     }
 
-    /**
-     * Prints program usage with configuration files examples
-     */
     private void printUsage() {
-        StringBuilder sb = new StringBuilder("Usage: XmlSigner -h");
+        StringBuilder sb = new StringBuilder();
+        sb.append("CESNET Metadata Signer v. 2\n\n");
         sb.append("Usage: XmlSigner -h\n");
-        sb.append("       XmlSigner -i <input_file.xml> -o <output_file.xml> -cfg <cfg_file>\n\n");
-        sb.append("  Sample cfg_file:\n");
-        sb.append("      providerclass = sun.security.pkcs11.SunPKCS11\n");
-        sb.append("      providertype = PKCS11\n");
-        sb.append("      providerconfig = signer.cfg\n");
-        sb.append("      pin = mysecretpin\n");
-        sb.append("      signingalias = key_alias\n\n");
-        sb.append("  Sample providerconfig (signer.cfg) file:");
-        sb.append("               name=NFastJava");
-        sb.append("               library=/opt/nfast/toolkits/pkcs11/libcknfast.so");
-        sb.append("               slotListIndex=1");
-        sb.append("               attributes(generate,CKO_PRIVATE_KEY,*) = {");
-        sb.append("                   CKA_PRIVATE = true");
-        sb.append("                   CKA_SIGN = true");
-        sb.append("                   CKA_DECRYPT = true");
-        sb.append("                   CKA_TOKEN = true");
-        sb.append("               }\n");
+        sb.append("           prints this help\n");
+        sb.append("       XmlSigner -i <input_file.xml> -o <output_file.xml> -cfg <cfg_file> [-alg <sha256|sha1|sha512>] [-position <first|last|n>]\n");
+        sb.append("           signs and verifies metadata\n");
+        sb.append("           -i file to sign\n");
+        sb.append("           -o signed file name\n");
+        sb.append("           -cfg configuration file\n");
+        sb.append("           -alg signature algorithm (default is sha256)\n");
+        sb.append("           -position signature position in signed xml file. First - as first\n");
+        sb.append("               element, last - as last element, n - as nth element (default is first)\n");
+        sb.append("       XmlSigner -info <cfg_file>\n");
+        sb.append("           prints keystore info\n");
+        sb.append("\n");
+        sb.append("  Sample cfg_file while using nCipher HSM:\n");
+        sb.append("      keystore = my_store.jks\n");
+        sb.append("      keystoretype = nCipher.sworld\n");
+        sb.append("      keystoreprovider = nCipherKM\n");
+        sb.append("      password = mysecretpassword\n");
+        sb.append("      signingalias = key_alias\n");
+        sb.append("\n");
+        sb.append("Return value:\n");
+        sb.append("    0 - OK, document was signed and verified.\n");
+        sb.append("    >0 - An error occured.\n");
         System.out.println(sb.toString());
     }
 
-    /**
-     * Proccesses command line parameters
-     * @param args
-     * @return
-     * @throws Exception
-     */
     private boolean parseParams(String[] args) throws Exception {
-        if (args.length == 0) {
-            printUsage();
-            return false;
-        }
 
-        if (args.length == 1) {
+        if (args.length == 0) {
+            this.printUsage();
+            return false;
+        } else if (args.length == 1) {
             if (args[0].equals("-h")) {
-                printUsage();
+                this.printUsage();
+                return false;
+            } else {
+                System.out.println("Unknown parameter: " + args[0]);
+                this.printUsage();
                 return false;
             }
-            System.out.println("Wrong parameter: " + args[1]);
-            printUsage();
+        } else if (args.length % 2 == 1) {
+            System.out.println("Wrong parameter usage.");
+            this.printUsage();
             return false;
-        }
-
-        if (args.length == 2) {
+        } else if (args.length == 2) {
             if (args[0].equals("-info")) {
                 this.cfgFile = args[1];
+
                 try {
-                    if (!loadIniParams(this.cfgFile)) {
+                    if (!this.loadIniParams(this.cfgFile)) {
                         System.exit(1);
                     }
-                } catch (FileNotFoundException e) {
+                } catch (FileNotFoundException var10) {
                     System.err.println("Error: Cannot find configuration file " + this.cfgFile);
                     System.exit(1);
                 }
+
                 this.infoOnly = true;
                 return true;
+            } else {
+                System.out.println("Unknown parameter: " + args[1]);
+                this.printUsage();
+                return false;
             }
-            System.out.println("Wrong parameter: " + args[1]);
-            printUsage();
-            return false;
-        }
+        } else {
+            boolean iparam = false;
+            boolean oparam = false;
+            boolean cfgparam = false;
 
-        if (args.length % 2 == 1) {
-            System.out.println("Wrong parameter usage.");
-            printUsage();
-            return false;
-        }
+            for(int i = 0; i < args.length; ++i) {
+                if (args[i].equals("-i")) {
+                    iparam = true;
+                    this.inputFile = args[++i];
+                } else if (args[i].equals("-o")) {
+                    oparam = true;
+                    this.outputFile = args[++i];
+                } else if (args[i].equals("-cfg")) {
+                    cfgparam = true;
+                    this.cfgFile = args[++i];
+                } else {
+                    if (args[i].equals("-alg")) {
+                        String alg = args[++i];
+                        switch(alg.toLowerCase()) {
+                            case "sha1":
+                                this.digestMethod = SHA1_DIGEST;
+                                this.signatureMethod = SHA1_METHOD;
+                                break;
+                            case "sha512":
+                                this.digestMethod = SHA512_DIGEST;
+                                this.signatureMethod = SHA512_METHOD;
+                                break;
+                            case "sha256":
+                                // Default value, do nothing
+                                break;
+                             default:
+                                 // Unknown method
+                                 System.err.println("Unknown digest method " + alg);
+                                 System.exit(7);
+                                 break;
+                        }
 
-        boolean iparam = false;
-        boolean oparam = false;
-        boolean cfgparam = false;
-        for (int i = 0; i < args.length; i++) {
-            if (args[i].equals("-i")) {
-                iparam = true;
-                i++;
-                this.inputFile = args[i];
-            } else if (args[i].equals("-o")) {
-                oparam = true;
-                i++;
-                this.outputFile = args[i];
-            } else if (args[i].equals("-cfg")) {
-                cfgparam = true;
-                i++;
-                this.cfgFile = args[i];
+                    } else if (args[i].equals("-position")) {
+                        signaturePosition = args[++i];
+                    } else {
+                        System.err.println("Unknown parameter " + args[i] + " was ignored.");
+                    }
+                }
+            }
+
+            if (iparam && oparam && cfgparam) {
+                this.loadIniParams(this.cfgFile);
+                return true;
+            } else {
+                System.out.println("Wrong parameter usage.");
+                this.printUsage();
+                return false;
             }
         }
-        if ((!iparam) || (!oparam) || (!cfgparam)) {
-            System.out.println("Wrong parameter usage.");
-            printUsage();
-            return false;
-        }
-        loadIniParams(this.cfgFile);
-        return true;
     }
 
     /**
-     * Processes configuration file
      * @param iniFileName
      * @return
      * @throws Exception
      */
     private boolean loadIniParams(String iniFileName) throws Exception {
-        boolean ret = true;
         Properties p = new Properties();
         p.load(new FileInputStream(iniFileName));
-        StringBuilder sb = new StringBuilder();
-        String err = "Error: While using configuration file " + iniFileName + " there was error\n";
 
-        String s = p.getProperty("providerclass");
-        if (s == null) {
-            sb.append(err);
-            sb.append("Error: Cannot find key \"providerclass\" in config file.\n");
-            ret = false;
-        } else {
-            this.providerClass = s;
+        this.keyStoreFileName = p.getProperty("keystore");
+        if(this.keyStoreFileName == null) {
+            logger.error("Error: Cannot find key \"keystore\" in config file.\n");
+            return false;
         }
 
-        s = p.getProperty("providertype");
-        if (s == null) {
-            if (ret) {
-                sb.append(err);
-            }
-            sb.append("Error: Cannot find key \"providertype\" in config file.\n");
-            ret = false;
-        } else {
-            this.providerType = s;
+        this.keyStoreType = p.getProperty("keystoretype");
+        if(this.keyStoreType == null) {
+            logger.error("Error: Cannot find key \"keystoretype\" in config file.\n");
+            return false;
         }
 
-        s = p.getProperty("providerconfig");
-        if (s == null) {
-            if (ret) {
-                sb.append(err);
-            }
-            sb.append("Error: Cannot find key \"providerconfig\" in config file.\n");
-            ret = false;
-        } else {
-            this.providerConfig = s;
+        this.keyStoreProvider = p.getProperty("keystoreprovider");
+        if(this.keyStoreProvider == null) {
+            logger.error("Error: Cannot find key \"keystoreprovider\" in config file.\n");
+            return false;
         }
 
-        s = p.getProperty("pin");
-        if (s == null) {
-            if (ret) {
-                sb.append(err);
-            }
-            sb.append("Error: Cannot find key \"pin\" in config file.\n");
-            ret = false;
-        } else {
-            this.pin = s.toCharArray();
+        String pwd = p.getProperty("password");
+        if(pwd == null) {
+            logger.error("Error: Cannot find key \"password\" in config file.\n");
+            return false;
+        }
+        this.password = pwd.toCharArray();
+
+        this.signingAlias = p.getProperty("signingalias");
+        if(this.signingAlias == null) {
+            logger.error("Error: Cannot find key \"signingalias\" in config file.\n");
+            return false;
         }
 
-        s = p.getProperty("signingalias");
-        if (s == null) {
-            if (ret) {
-                sb.append(err);
-            }
-            sb.append("Error: Cannot find key \"signingalias\" in config file.\n");
-            ret = false;
-        } else {
-            this.signingAlias = s;
-        }
-
-        if (!ret) {
-            System.err.println(sb.toString());
-        }
-        return ret;
+        return true;
     }
 
     public static void main(String[] args) {
-        XmlSigner xs = new XmlSigner();
-        try {
-            if (!xs.parseParams(args)) {
-                System.exit(1);
-                return;
-            }
 
-            xs.initialize(xs.providerClass, xs.providerType, xs.providerConfig, null, xs.pin);
-            if (xs.infoOnly) {
-                xs.printInfo();
+        logger.trace("main <");
+
+        logger.info(logger.getClass().getName());
+
+        XmlSigner signer = new XmlSigner();
+        try {
+            if (!signer.parseParams(args)) {
+                System.exit(1);
+            }
+            signer.initialize(signer.keyStoreFileName, signer.password);
+            if (signer.infoOnly) {
+                signer.printInfo();
                 System.exit(0);
             }
-            // Sign the federation metadata
-            xs.signMetadata();
+            signer.signMetadata();
             System.exit(0);
-        } catch (ClassNotFoundException e) {
-            System.err.println("Class not found: " + e.getMessage() + "\nTry to check value of \"providerclass\" in config file " + xs.cfgFile + ".");
-            System.exit(2);
         } catch (Exception e) {
             e.printStackTrace();
-            System.exit(3);
+            System.exit(100);
         }
     }
 }
