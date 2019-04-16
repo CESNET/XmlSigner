@@ -1,6 +1,44 @@
+# XmlSigner #
+
 XmlSigner is a federation metadata signer.
 
-### License ###
+## How to try it ##
+
+### Create PKCS12 file  ###
+
+openssl req -x509 -newkey rsa:2048 -keyout private_key.pem -out certificate.pem -days 3650
+
+openssl pkcs12 -export -out sample-signer.p12 -inkey private_key.pem -in certificate.pem -name sample-signer
+
+### Get binary application ###
+
+Checkout project, including binary application XmlSigner.jar:
+
+git clone https://github.com/CESNET/XmlSigner.git
+
+### Configure the application ###
+
+1) Copy XmlSigner.jar to /opt/signer
+
+2) Copy PKCS12 file to /etc/signer
+
+3) Create file /etc/signer/signer.cfg with the following content:
+
+    keystore = /etc/signer/sample-signer.p12
+    
+    keystoretype = pkcs12
+    
+    keystoreprovider = SunJSSE
+    
+    password = ***
+    
+    signingalias = sample-signer
+
+### Run the application ###
+
+java -jar /opt/signer/XmlSigner.jar -cfg /etc/signer/signer.cfg -i <input_metadata_to_sign.xml> -o <output_signed_metadata.xml>
+
+## License ##
 
 &copy; 2010-2018 [CESNET](https://www.cesnet.cz/?lang=en), all rights reserved.
 
