@@ -6,9 +6,13 @@ XmlSigner is a federation metadata signer.
 
 ### Create PKCS12 file  ###
 
+Run the two following commands:
+
 openssl req -x509 -newkey rsa:2048 -keyout private_key.pem -out certificate.pem -days 3650
 
 openssl pkcs12 -export -out sample-signer.p12 -inkey private_key.pem -in certificate.pem -name sample-signer
+
+It creates the PKCS12 file sample-signer.p12.
 
 ### Get binary application ###
 
