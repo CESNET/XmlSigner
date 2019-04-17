@@ -16,7 +16,7 @@ It creates the PKCS12 file sample-signer.p12.
 
 ### Get binary application ###
 
-Checkout project, including binary application XmlSigner.jar:
+Checkout project, including compiled application XmlSigner.jar:
 
 git clone https://github.com/CESNET/XmlSigner.git
 
